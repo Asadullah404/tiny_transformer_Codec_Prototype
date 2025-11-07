@@ -29,6 +29,8 @@ pip install torch numpy librosa soundfile
 
 Add Weights:
 Place your trained tiny_transformer_best.pt file in the same directory as these scripts.
+ OR 
+EPOCH 131 Best Weights will be downaloded its self
 
 Run the Streaming Example:
 
@@ -93,5 +95,6 @@ Decode: We pass the resulting indices to codec.decode_audio().
 Save: The model returns a 480-sample chunk. The first 240 samples are "warm-up" (for the causal convolutions and transformer) and are discarded. We keep only the last 240 samples.
 
 Hop: We advance our input stream by 240 samples (15ms) and repeat the process.
+
 
 This ensures that the model always has 240 samples of "past context" (the overlap) to correctly predict the 240 samples of "new audio" (the save).
