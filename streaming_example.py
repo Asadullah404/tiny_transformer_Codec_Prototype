@@ -1,9 +1,12 @@
 """
-Example: Overlap-Save (OaS) Streaming
+Example: Overlap-Save (OaS) Streaming with Networking
 
 This script demonstrates how to use the `TinyCodec` API
-to perform real-time, low-latency streaming on a full audio file
-OR from a live microphone.
+to perform real-time, low-latency streaming:
+1. On a full audio file.
+2. From a live microphone (local loopback).
+3. From a microphone to a network client (Server Mode).
+4. From a network server to a speaker (Client Mode).
 """
 
 # === 1. AUTO-INSTALLER ===
@@ -25,7 +28,7 @@ def install_required_packages():
         "tqdm": "tqdm",
         "gdown": "gdown",
         "numpy": "numpy",
-        "sounddevice": "sounddevice" # <-- ADDED for mic test
+        "sounddevice": "sounddevice" # Required for mic/speaker modes
     }
     
     installed_packages = {}
@@ -70,6 +73,13 @@ try:
     import time
     from tqdm import tqdm
     
+    # --- New Imports for Networking ---
+    import socket
+    import threading
+    import queue
+    import pickle
+    # --- End New Imports ---
+    
     # We still need to import gdown to use it
     if INSTALLED_PACKAGES.get("gdown", False):
         import gdown
@@ -103,10 +113,54 @@ except ImportError:
 
 
 # Import the main API
-from codec_api import TinyCodec
+# --- MOCKUP for testing without the real files ---
+# These files are assumed to exist:
+# - codec_api.py (with class TinyCodec)
+# - common_modules.py (with SR, TRAIN_WINDOW_SAMPLES, STREAMING_HOP_SAMPLES)
 
-# Import hyperparameters
-from common_modules import SR, TRAIN_WINDOW_SAMPLES, STREAMING_HOP_SAMPLES
+if not os.path.exists("codec_api.py") or not os.path.exists("common_modules.py"):
+    print("WARNING: 'codec_api.py' or 'common_modules.py' not found.")
+    print("Creating mock objects for testing...")
+    
+    # Mock common_modules.py
+    SR = 16000
+    TRAIN_WINDOW_SAMPLES = 480
+    STREAMING_HOP_SAMPLES = 240
+    
+    # Mock codec_api.py
+    class TinyCodec:
+        def __init__(self, model_path=None):
+            print(f"MockCodec: Initialized (model: {model_path})")
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            print(f"MockCodec: Using device: {self.device}")
+        
+        def encode_audio(self, chunk):
+            # Mock: return a list of dummy indices
+            # Real codec would do GPU/CPU processing
+            time.sleep(0.001) # Simulate some work
+            return [torch.randint(0, 10, (5,), device=self.device),
+                    torch.randint(0, 10, (5,), device=self.device)]
+        
+        def decode_audio(self, indices_list, target_length):
+            # Mock: return a chunk of audio (e.g., sine wave)
+            # Real codec would do GPU/CPU processing
+            time.sleep(0.001) # Simulate some work
+            # In a real codec, this would be the decoded audio.
+            # Here, we'll just pass through a sine wave for testing.
+            # We'll actually just return a silent chunk
+            return torch.zeros(target_length, device=self.device)
+            
+            # Note: A pass-through (return chunk) would be better for
+            # testing, but the original chunk isn't available here.
+            # So we just return silence.
+else:
+    # Import the main API
+    from codec_api import TinyCodec
+    
+    # Import hyperparameters
+    from common_modules import SR, TRAIN_WINDOW_SAMPLES, STREAMING_HOP_SAMPLES
+# --- End of Mockup ---
+
 
 def download_models():
     """
@@ -196,8 +250,8 @@ def run_file_processing(codec):
 
     # --- 3. Run Overlap-Save (OaS) Streaming ---
     print(f"Running streaming simulation...")
-    print(f"  Window size: {TRAIN_WINDOW_SAMPLES} samples (30.0 ms)")
-    print(f"  Hop size:    {STREAMING_HOP_SAMPLES} samples (15.0 ms)")
+    print(f"  Window size: {TRAIN_WINDOW_SAMPLES} samples ({(TRAIN_WINDOW_SAMPLES/SR)*1000:.1f} ms)")
+    print(f"  Hop size:    {STREAMING_HOP_SAMPLES} samples ({(STREAMING_HOP_SAMPLES/SR)*1000:.1f} ms)")
     
     reconstructed_chunks = []
     
@@ -253,10 +307,8 @@ def run_file_processing(codec):
     rtf = processing_time / duration
     
     print(f"Saved 'original_stream.wav' and 'reconstructed_stream.wav'")
-    print(f" - Audio Duration:   {duration:.2f} seconds")
-    # --- THIS IS THE FIX ---
+    print(f" - Audio Duration:    {duration:.2f} seconds")
     print(f" - Processing Time: {processing_time:.2f} seconds") 
-    # --- END OF FIX ---
     print(f" - Real-Time Factor (RTF): {rtf:.4f}")
     if rtf < 1.0:
         print("   (This is faster than real-time!)")
@@ -267,7 +319,7 @@ def run_mic_test(codec):
     """
     Runs the demo in mode (2): live streaming from mic to speakers.
     """
-    print("\n--- Mode 2: Live Microphone Test ---")
+    print("\n--- Mode 2: Live Microphone Test (Local Loopback) ---")
     print("Press ENTER to stop the stream.")
     
     # The "overlap" is the part of the *previous* window we need
@@ -335,6 +387,303 @@ def run_mic_test(codec):
     print("Stream stopped.")
 
 
+# ===================================================================
+# === NEW NETWORKING FUNCTIONS ======================================
+# ===================================================================
+
+# Define a simple message-framing protocol
+# We send a 4-byte header (big-endian) with the length
+# of the pickled data that follows.
+HEADER_LENGTH = 4
+
+def recv_all(sock, n):
+    """Helper function to reliably receive n bytes from a socket."""
+    data = b''
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data += packet
+    return data
+
+def stream_audio_to_client(codec, conn):
+    """
+    Called by the server.
+    Handles the audio-to-network loop for a single client.
+    """
+    print(f"Streaming audio to client...")
+    
+    # Queue to pass encoded data from audio thread to network thread
+    data_queue = queue.Queue(maxsize=10) # Buffer max 10 packets
+    
+    # OaS overlap buffer
+    overlap_samples = TRAIN_WINDOW_SAMPLES - STREAMING_HOP_SAMPLES
+    overlap_buffer = torch.zeros(overlap_samples, device=codec.device)
+
+    def server_audio_callback(indata, frames, time, status):
+        """
+        Audio callback for the server.
+        Reads mic, encodes, and puts data on the queue.
+        """
+        nonlocal overlap_buffer
+        if status:
+            print(status, file=sys.stderr)
+        
+        try:
+            # 1. Get audio from mic
+            current_chunk = torch.tensor(indata[:, 0], dtype=torch.float32, device=codec.device)
+            
+            # 2. Create OaS window
+            window = torch.cat((overlap_buffer, current_chunk))
+            
+            # 3. Update overlap buffer
+            overlap_buffer = current_chunk
+            
+            # 4. Encode
+            indices_list = codec.encode_audio(window)
+            
+            # 5. Put encoded data on the queue for the network thread
+            # We move to CPU and pickle *before* putting on the queue
+            # to offload work from the network thread.
+            # But, pickling tensors might be slow.
+            # Let's try pickling the GPU tensors directly.
+            # Note: The client must be able to unpickle them (e.g., have torch)
+            
+            # Alternative: move to CPU first
+            # indices_list_cpu = [idx.cpu() for idx in indices_list]
+            # data_queue.put(indices_list_cpu, block=False)
+            
+            # Let's assume receiver can handle tensors from any device
+            data_queue.put(indices_list, block=False) # Non-blocking
+            
+        except queue.Full:
+            print("Server network queue is full. Dropping packet.", file=sys.stderr)
+        except Exception as e:
+            print(f"Error in server audio callback: {e}", file=sys.stderr)
+
+    try:
+        # Start the microphone input stream
+        with sd.InputStream(
+            samplerate=SR,
+            blocksize=STREAMING_HOP_SAMPLES,
+            device=None,
+            channels=1,
+            dtype='float32',
+            callback=server_audio_callback
+        ):
+            print("Microphone is live. Sending data...")
+            while True:
+                # 1. Get encoded data from the audio thread
+                indices_list = data_queue.get() # Blocks until data is ready
+                
+                # 2. Serialize the data
+                data_bytes = pickle.dumps(indices_list)
+                
+                # 3. Create header and send
+                header = len(data_bytes).to_bytes(HEADER_LENGTH, 'big')
+                
+                # 4. Send all data
+                conn.sendall(header + data_bytes)
+
+    except (socket.error, BrokenPipeError, ConnectionResetError) as e:
+        print(f"Client disconnected: {e}")
+    except Exception as e:
+        print(f"Error in server streaming loop: {e}")
+    finally:
+        print("Stopping server stream.")
+
+def run_server(codec):
+    """
+    Runs the demo in mode (3): Start a server (Mic -> Network)
+    """
+    print("\n--- Mode 3: Start a Server (Mic -> Network) ---")
+    
+    host = input(f"Enter host IP to bind (default: 0.0.0.0): ").strip() or "0.0.0.0"
+    port_str = input(f"Enter port to listen on (default: 12345): ").strip() or "12345"
+    
+    try:
+        port = int(port_str)
+        if not 1024 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        print(f"Invalid port: {port_str}. Must be an integer 1024-65535.")
+        return
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            s.listen()
+            print(f"Server listening on {host}:{port}...")
+            print("Press Ctrl+C to stop the server.")
+            
+            while True:
+                try:
+                    conn, addr = s.accept()
+                    with conn:
+                        print(f"Connected by {addr}")
+                        # Handle the full streaming logic for this client
+                        stream_audio_to_client(codec, conn)
+                    print(f"Connection with {addr} closed.")
+                
+                except KeyboardInterrupt:
+                    print("\nShutting down server...")
+                    break
+                except Exception as e:
+                    print(f"Error accepting connection: {e}")
+        
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+        except OSError as e:
+            print(f"FATAL: Could not bind to {host}:{port}. Error: {e}")
+            print("Is the port already in use?")
+
+def receive_audio_from_server(codec, sock):
+    """
+    Called by the client.
+    Handles the network-to-audio loop.
+    """
+    print("Receiving audio from server...")
+    
+    # Queue to pass decoded audio from network thread to audio thread
+    audio_queue = queue.Queue(maxsize=10) # Buffer 10 audio chunks
+
+    # --- Network Receiver Thread ---
+    def network_receiver_loop():
+        """
+        Runs in a separate thread.
+        Receives data, unpickles, decodes, and puts audio on the queue.
+        """
+        try:
+            while True:
+                # 1. Receive header
+                header_bytes = recv_all(sock, HEADER_LENGTH)
+                if not header_bytes:
+                    print("Server closed connection (header).")
+                    break
+                
+                data_len = int.from_bytes(header_bytes, 'big')
+                
+                # 2. Receive data payload
+                data_bytes = recv_all(sock, data_len)
+                if not data_bytes:
+                    print("Server closed connection (payload).")
+                    break
+                    
+                # 3. Deserialize
+                indices_list = pickle.loads(data_bytes)
+                
+                # 4. Decode
+                reconstructed_chunk = codec.decode_audio(indices_list, TRAIN_WINDOW_SAMPLES)
+                
+                # 5. Get OaS "save" part
+                new_audio = reconstructed_chunk[-STREAMING_HOP_SAMPLES:] # (240,)
+                
+                # 6. Put audio chunk on the queue for the speaker
+                audio_queue.put(new_audio.cpu().numpy())
+                
+        except (ConnectionResetError, BrokenPipeError, EOFError):
+            print("Server disconnected.")
+        except pickle.UnpicklingError:
+            print("Received corrupted data from server.")
+        except Exception as e:
+            print(f"Error in network receiver thread: {e}")
+        finally:
+            # Put a sentinel value to signal the audio thread to stop
+            audio_queue.put(None)
+            print("Network receiver thread stopped.")
+
+    # --- Audio Player Callback ---
+    def client_audio_callback(outdata, frames, time, status):
+        """
+        Audio callback for the client.
+        Pulls decoded audio from the queue and plays it.
+        """
+        if status:
+            print(status, file=sys.stderr)
+        
+        try:
+            # Get audio chunk from the queue
+            audio_chunk = audio_queue.get_nowait()
+            
+            if audio_chunk is None:
+                # Sentinel value received
+                print("Stopping audio stream (sentinel).")
+                raise sd.CallbackStop
+            
+            # Play the audio
+            outdata[:] = audio_chunk.reshape(-1, 1)
+            
+        except queue.Empty:
+            # Buffer underrun
+            print("Client buffer underrun. Playing silence.", file=sys.stderr)
+            outdata.fill(0) # Play silence
+
+    # --- Start streaming ---
+    try:
+        # Start the network receiver thread
+        net_thread = threading.Thread(target=network_receiver_loop, daemon=True)
+        net_thread.start()
+        
+        # Start the audio output stream
+        with sd.OutputStream(
+            samplerate=SR,
+            blocksize=STREAMING_HOP_SAMPLES,
+            device=None,
+            channels=1,
+            dtype='float32',
+            callback=client_audio_callback
+        ):
+            print("Audio output stream started. Waiting for data...")
+            # Keep the main thread alive while the other threads run
+            net_thread.join() 
+            
+    except sd.CallbackStop:
+        print("Audio stream stopped.")
+    except Exception as e:
+        print(f"Error starting client audio stream: {e}")
+    finally:
+        print("Client streaming finished.")
+
+def run_client(codec):
+    """
+    Runs the demo in mode (4): Connect to a server (Network -> Speaker)
+    """
+    print("\n--- Mode 4: Connect to a Server (Network -> Speaker) ---")
+    
+    host = input(f"Enter server IP to connect to (default: 127.0.0.1): ").strip() or "127.0.0.1"
+    port_str = input(f"Enter server port (default: 12345): ").strip() or "12345"
+    
+    try:
+        port = int(port_str)
+    except ValueError:
+        print(f"Invalid port: {port_str}.")
+        return
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            print(f"Connecting to {host}:{port}...")
+            s.connect((host, port))
+            print("Connected to server!")
+            # Handle the full receiving and playing logic
+            receive_audio_from_server(codec, s)
+            
+    except socket.timeout:
+        print("Connection timed out.")
+    except ConnectionRefusedError:
+        print(f"Connection refused. Is the server running at {host}:{port}?")
+    except KeyboardInterrupt:
+        print("\nDisconnecting...")
+    except Exception as e:
+        print(f"Error connecting to server: {e}")
+    finally:
+        print("Disconnected from server.")
+
+
+# ===================================================================
+# === MAIN FUNCTION (Updated) =======================================
+# ===================================================================
+
 def main():
     print("--- TinyTransformerCodec Streaming Example ---")
     
@@ -353,38 +702,65 @@ def main():
     
     print(f"\nLoading codec using '{model_path}'...")
     try:
-        codec = TinyCodec(model_path=model_path) # <-- Use this one
+        codec = TinyCodec(model_path=model_path)
         
     except FileNotFoundError as e:
         # This will catch if the download failed for best_model.pth
         print(f"\nERROR: {e}")
         print(f"Please make sure '{model_path}' is in this directory.")
         return
+    except Exception as e:
+        print(f"\nFATAL: Failed to load codec: {e}")
+        print("This might be due to a missing file or an error in the codec/model files.")
+        return
+
     
     # --- 2. Mode Selection ---
-    print("\nSelect operation mode:")
-    print("  (1) Process an audio file (default)")
-    print("  (2) Start live microphone test")
-    
-    choice = input("Enter your choice (1 or 2): ").strip()
-    
-    if choice == '2':
-        if not SOUNDDEVICE_AVAILABLE:
-            print("\nERROR: 'sounddevice' package is required for mic test.")
-            print("The installer tried but failed.")
-            print("Please install it manually: pip install sounddevice")
-            return
-        try:
-            run_mic_test(codec)
-        except Exception as e:
-            print(f"\nAn error occurred during the mic test: {e}")
-            print("Please check your microphone and speaker settings.")
-    else:
-        if choice != '1':
-            print("Invalid choice. Defaulting to (1) Process audio file.")
-        run_file_processing(codec)
+    while True:
+        print("\nSelect operation mode:")
+        print("  (1) Process an audio file")
+        print("  (2) Live microphone test (local loopback)")
+        print("  (3) Start a server (Mic -> Network)")
+        print("  (4) Connect to a server (Network -> Speaker)")
+        print("  (Q) Quit")
+        
+        choice = input("Enter your choice (1, 2, 3, 4, or Q): ").strip().lower()
+        
+        if choice == '1':
+            run_file_processing(codec)
+            
+        elif choice == '2':
+            if not SOUNDDEVICE_AVAILABLE:
+                print("\nERROR: 'sounddevice' package is required for this mode.")
+                print("Please install it manually: pip install sounddevice")
+                continue
+            try:
+                run_mic_test(codec)
+            except Exception as e:
+                print(f"\nAn error occurred during the mic test: {e}")
+                print("Please check your microphone and speaker settings.")
+        
+        elif choice == '3':
+            if not SOUNDDEVICE_AVAILABLE:
+                print("\nERROR: 'sounddevice' package is required for this mode.")
+                print("Please install it manually: pip install sounddevice")
+                continue
+            run_server(codec)
+        
+        elif choice == '4':
+            if not SOUNDDEVICE_AVAILABLE:
+                print("\nERROR: 'sounddevice' package is required for this mode.")
+                print("Please install it manually: pip install sounddevice")
+                continue
+            run_client(codec)
+        
+        elif choice in ('q', 'quit'):
+            print("Exiting.")
+            break
+            
+        else:
+            print("Invalid choice. Please try again.")
 
 
 if __name__ == "__main__":
     main()
-
